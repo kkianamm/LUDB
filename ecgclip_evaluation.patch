@@ -1,0 +1,1976 @@
+diff --git a/README_EVALUATION.md b/README_EVALUATION.md
+new file mode 100644
+index 0000000..be5577b
+--- /dev/null
++++ b/README_EVALUATION.md
+@@ -0,0 +1,98 @@
++# ECGCLIP evaluation patch
++
++This patch adds one shared metric implementation for zero-shot BiomedCLIP,
++BiomedCoOp prompt tuning, and the frozen-feature linear probe.
++
++## Files
++
++- `evaluation.py`: single-label and multi-label metrics, validation threshold
++  selection, JSON output.
++- `zero_shot_eval.py`: replacement that supports `--task single|multi`.
++- `train_biomedcoop.py`: replacement with common evaluation, safer checkpoint
++  loading, result JSON files, and deterministic few-shot sampling.
++- `linear_probe.py`: replacement using the same multi-label metrics.
++- `aggregate_results.py`: aggregates result JSON files across seeds.
++- `run_fewshot_evaluation.sh`: runs K={1,2,4,8,16}, seeds={1,2,3} for both
++  protocols.
++
++## Install
++
++Copy the files into the repository root, replacing the three scripts with the
++same names:
++
++```bash
++cp evaluation.py /path/to/ecgclip/
++cp aggregate_results.py /path/to/ecgclip/
++cp run_fewshot_evaluation.sh /path/to/ecgclip/
++cp zero_shot_eval.py /path/to/ecgclip/
++cp train_biomedcoop.py /path/to/ecgclip/
++cp linear_probe.py /path/to/ecgclip/
++```
++
++Or apply the supplied unified patch from the repository root:
++
++```bash
++git apply ecgclip_evaluation.patch
++```
++
++## Smoke tests
++
++```bash
++python -m py_compile evaluation.py zero_shot_eval.py \
++  train_biomedcoop.py linear_probe.py aggregate_results.py
++
++python zero_shot_eval.py --task multi --limit 200
++python zero_shot_eval.py --task single --limit 200
++python train_biomedcoop.py --task multi --shots 1 --seed 1 \
++  --epochs 1 --limit 500
++python train_biomedcoop.py --task single --shots 1 --seed 1 \
++  --epochs 1 --limit 500
++```
++
++Do not use `--limit` for final reported results because taking the first rows of
++fold 9 or fold 10 can remove positives from a class.
++
++## Final experiments
++
++```bash
++./run_fewshot_evaluation.sh
++```
++
++Results are written to `work/results/*.json`; the aggregate table is written to
++`work/results/biomedcoop_summary.csv`.
++
++### Direct BiomedCoOp-style comparison
++
++Use the single-label rows and report mean ± standard deviation across seeds:
++
++- Accuracy
++- Macro F1
++- Balanced accuracy
++
++The primary headline metric is accuracy.
++
++### Native PTB-XL comparison
++
++Use the multi-label rows and report mean ± standard deviation across seeds:
++
++- Macro and micro AUROC
++- Macro and micro AUPRC
++- Macro and micro F1
++- Per-class AUROC, AUPRC, sensitivity, and specificity
++
++Fold 9 selects F1 thresholds. Fold 10 is only used for final evaluation.
++
++## Important seed interpretation
++
++Changing only an evaluation seed should not change deterministic test results.
++Seeds should change few-shot sampling, prompt initialization, minibatch order,
++or model training. Zero-shot evaluation has no training seed and is expected to
++produce identical results for the same checkpoint and data.
++
++## Base-to-novel
++
++This patch does not claim an official base-to-novel result. With only five
++PTB-XL superclasses, base/novel results are highly split-dependent. Add that as
++a separate experiment only after defining fixed class splits and rebuilding the
++prompt learner for novel class names while transferring a shared context
++(`CSC=False`).
+diff --git a/aggregate_results.py b/aggregate_results.py
+new file mode 100644
+index 0000000..c10cf99
+--- /dev/null
++++ b/aggregate_results.py
+@@ -0,0 +1,107 @@
++"""Aggregate ECGCLIP result JSON files across seeds.
++
++Examples:
++    python aggregate_results.py
++    python aggregate_results.py --pattern 'work/results/biomedcoop_*.json'
++    python aggregate_results.py --output work/results/summary.csv
++"""
++from __future__ import annotations
++
++import argparse
++import glob
++import json
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++
++
++HEADLINE_METRICS = (
++    "accuracy",
++    "error_rate",
++    "balanced_accuracy",
++    "macro_auroc",
++    "micro_auroc",
++    "macro_auprc",
++    "micro_auprc",
++    "macro_f1",
++    "micro_f1",
++    "top1_hit_accuracy",
++)
++
++
++def load_row(path: str) -> dict:
++    payload = json.loads(Path(path).read_text())
++    metadata = payload.get("metadata", {})
++    metrics = payload.get("metrics", {})
++
++    row = {
++        "file": path,
++        "method": metadata.get("method"),
++        "task": metadata.get("task"),
++        "shots": metadata.get("shots"),
++        "seed": metadata.get("seed"),
++    }
++    for metric_name in HEADLINE_METRICS:
++        value = metrics.get(metric_name)
++        row[metric_name] = np.nan if value is None else value
++    return row
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument(
++        "--pattern",
++        default="work/results/*.json",
++        help="glob pattern for result JSON files",
++    )
++    parser.add_argument(
++        "--output",
++        default="work/results/summary.csv",
++        help="CSV path for the aggregated table",
++    )
++    args = parser.parse_args()
++
++    paths = sorted(glob.glob(args.pattern))
++    if not paths:
++        raise FileNotFoundError(f"No result files matched {args.pattern!r}")
++
++    runs = pd.DataFrame(load_row(path) for path in paths)
++    group_columns = ["method", "task", "shots"]
++    metric_columns = [
++        column
++        for column in HEADLINE_METRICS
++        if column in runs and runs[column].notna().any()
++    ]
++
++    grouped = runs.groupby(group_columns, dropna=False)[metric_columns]
++    mean = grouped.mean().add_suffix("_mean")
++    std = grouped.std(ddof=1).add_suffix("_std")
++    count = grouped.count().add_suffix("_n")
++    summary = pd.concat([mean, std, count], axis=1).reset_index()
++
++    ordered_columns = list(group_columns)
++    for metric_name in metric_columns:
++        ordered_columns.extend(
++            [f"{metric_name}_mean", f"{metric_name}_std", f"{metric_name}_n"]
++        )
++    summary = summary[ordered_columns]
++
++    output_path = Path(args.output)
++    output_path.parent.mkdir(parents=True, exist_ok=True)
++    summary.to_csv(output_path, index=False)
++
++    with pd.option_context(
++        "display.max_columns",
++        None,
++        "display.width",
++        220,
++        "display.float_format",
++        "{:.4f}".format,
++    ):
++        print(summary.to_string(index=False))
++    print(f"\nSaved aggregate table -> {output_path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/evaluation.py b/evaluation.py
+new file mode 100644
+index 0000000..287a64c
+--- /dev/null
++++ b/evaluation.py
+@@ -0,0 +1,381 @@
++"""Shared evaluation utilities for ECGCLIP/PTB-XL experiments.
++
++The module intentionally separates:
++1. ranking scores used by AUROC/AUPRC; and
++2. probabilities used by threshold-dependent metrics such as F1.
++
++Thresholds must be selected on the validation fold and then frozen before
++calling ``evaluate_multilabel`` on the test fold.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any, Sequence
++
++import numpy as np
++from sklearn.metrics import (
++    accuracy_score,
++    average_precision_score,
++    balanced_accuracy_score,
++    confusion_matrix,
++    f1_score,
++    precision_recall_curve,
++    roc_auc_score,
++)
++
++
++def _as_2d_float(array: np.ndarray, name: str) -> np.ndarray:
++    result = np.asarray(array, dtype=np.float64)
++    if result.ndim != 2:
++        raise ValueError(f"{name} must be a 2-D array, got shape {result.shape}")
++    return result
++
++
++def _check_same_shape(*arrays: np.ndarray) -> None:
++    shapes = {array.shape for array in arrays}
++    if len(shapes) != 1:
++        raise ValueError(f"Arrays must have identical shapes, got {sorted(shapes)}")
++
++
++def _safe_divide(numerator: float, denominator: float) -> float:
++    return float(numerator / denominator) if denominator else float("nan")
++
++
++def tune_multilabel_thresholds(
++    y_true: np.ndarray,
++    probabilities: np.ndarray,
++    mode: str = "per-class",
++    fixed_threshold: float = 0.5,
++) -> np.ndarray:
++    """Select F1-maximising thresholds using validation data only.
++
++    Args:
++        y_true: Binary matrix of shape ``[n_samples, n_classes]``.
++        probabilities: Probability matrix with the same shape.
++        mode: ``per-class``, ``global`` or ``fixed``.
++        fixed_threshold: Used when ``mode='fixed'`` and as a fallback for
++            degenerate validation classes.
++    """
++    y_true = np.asarray(y_true, dtype=np.int64)
++    probabilities = _as_2d_float(probabilities, "probabilities")
++    _check_same_shape(y_true, probabilities)
++
++    if not 0.0 <= fixed_threshold <= 1.0:
++        raise ValueError("fixed_threshold must be between 0 and 1")
++
++    n_classes = y_true.shape[1]
++    if mode == "fixed":
++        return np.full(n_classes, fixed_threshold, dtype=np.float64)
++
++    if mode == "global":
++        candidates = np.linspace(0.01, 0.99, 99)
++        values = [
++            f1_score(
++                y_true,
++                probabilities >= threshold,
++                average="macro",
++                zero_division=0,
++            )
++            for threshold in candidates
++        ]
++        return np.full(n_classes, candidates[int(np.argmax(values))])
++
++    if mode != "per-class":
++        raise ValueError("mode must be one of: per-class, global, fixed")
++
++    thresholds = np.full(n_classes, fixed_threshold, dtype=np.float64)
++    for class_index in range(n_classes):
++        target = y_true[:, class_index]
++        score = probabilities[:, class_index]
++
++        # F1 threshold tuning is undefined if validation contains only one
++        # target value. Keep the declared fallback in that case.
++        if np.unique(target).size < 2:
++            continue
++
++        precision, recall, candidates = precision_recall_curve(target, score)
++        if candidates.size == 0:
++            continue
++
++        f1_values = (
++            2.0 * precision[:-1] * recall[:-1]
++            / np.clip(precision[:-1] + recall[:-1], 1e-12, None)
++        )
++        thresholds[class_index] = candidates[int(np.nanargmax(f1_values))]
++
++    return thresholds
++
++
++def evaluate_multilabel(
++    ranking_scores: np.ndarray,
++    y_true: np.ndarray,
++    probabilities: np.ndarray,
++    thresholds: Sequence[float] | float = 0.5,
++    class_names: Sequence[str] | None = None,
++) -> dict[str, Any]:
++    """Evaluate a multi-label classifier.
++
++    ``ranking_scores`` should be raw cosine similarities or logits. AUROC and
++    AUPRC are computed from these values. ``probabilities`` are used only for
++    threshold-dependent metrics.
++    """
++    ranking_scores = _as_2d_float(ranking_scores, "ranking_scores")
++    probabilities = _as_2d_float(probabilities, "probabilities")
++    y_true = np.asarray(y_true, dtype=np.int64)
++    _check_same_shape(ranking_scores, probabilities, y_true)
++
++    n_classes = y_true.shape[1]
++    if class_names is None:
++        class_names = [str(index) for index in range(n_classes)]
++    if len(class_names) != n_classes:
++        raise ValueError("class_names length must match the number of classes")
++
++    if np.isscalar(thresholds):
++        threshold_array = np.full(n_classes, float(thresholds))
++    else:
++        threshold_array = np.asarray(thresholds, dtype=np.float64)
++        if threshold_array.shape != (n_classes,):
++            raise ValueError(
++                f"thresholds must have shape ({n_classes},), "
++                f"got {threshold_array.shape}"
++            )
++
++    predictions = (probabilities >= threshold_array[None, :]).astype(np.int64)
++    valid_roc = np.array(
++        [np.unique(y_true[:, index]).size == 2 for index in range(n_classes)]
++    )
++    valid_pr = np.array([y_true[:, index].sum() > 0 for index in range(n_classes)])
++
++    def macro_auroc() -> float:
++        if not valid_roc.any():
++            return float("nan")
++        return float(
++            roc_auc_score(
++                y_true[:, valid_roc],
++                ranking_scores[:, valid_roc],
++                average="macro",
++            )
++        )
++
++    def micro_auroc() -> float:
++        if not valid_roc.any():
++            return float("nan")
++        return float(
++            roc_auc_score(
++                y_true[:, valid_roc],
++                ranking_scores[:, valid_roc],
++                average="micro",
++            )
++        )
++
++    def macro_auprc() -> float:
++        if not valid_pr.any():
++            return float("nan")
++        return float(
++            average_precision_score(
++                y_true[:, valid_pr],
++                ranking_scores[:, valid_pr],
++                average="macro",
++            )
++        )
++
++    def micro_auprc() -> float:
++        if not valid_pr.any():
++            return float("nan")
++        return float(
++            average_precision_score(
++                y_true[:, valid_pr],
++                ranking_scores[:, valid_pr],
++                average="micro",
++            )
++        )
++
++    per_class: dict[str, dict[str, float | int | None]] = {}
++    for index, class_name in enumerate(class_names):
++        target = y_true[:, index]
++        prediction = predictions[:, index]
++        score = ranking_scores[:, index]
++
++        tn, fp, fn, tp = confusion_matrix(
++            target,
++            prediction,
++            labels=[0, 1],
++        ).ravel()
++
++        per_class[str(class_name)] = {
++            "auroc": (
++                float(roc_auc_score(target, score))
++                if np.unique(target).size == 2
++                else None
++            ),
++            "auprc": (
++                float(average_precision_score(target, score))
++                if target.sum() > 0
++                else None
++            ),
++            "f1": float(f1_score(target, prediction, zero_division=0)),
++            "sensitivity": _safe_divide(tp, tp + fn),
++            "specificity": _safe_divide(tn, tn + fp),
++            "threshold": float(threshold_array[index]),
++            "support": int(target.sum()),
++            "tp": int(tp),
++            "tn": int(tn),
++            "fp": int(fp),
++            "fn": int(fn),
++        }
++
++    top1 = ranking_scores.argmax(axis=1)
++    top1_hit = float(np.mean(y_true[np.arange(len(y_true)), top1] == 1))
++
++    return {
++        "macro_auroc": macro_auroc(),
++        "micro_auroc": micro_auroc(),
++        "macro_auprc": macro_auprc(),
++        "micro_auprc": micro_auprc(),
++        "macro_f1": float(
++            f1_score(y_true, predictions, average="macro", zero_division=0)
++        ),
++        "micro_f1": float(
++            f1_score(y_true, predictions, average="micro", zero_division=0)
++        ),
++        "top1_hit_accuracy": top1_hit,
++        "label_cardinality": float(y_true.sum(axis=1).mean()),
++        "thresholds": threshold_array.tolist(),
++        "per_class": per_class,
++    }
++
++
++def evaluate_single_label(
++    scores: np.ndarray,
++    y_true: np.ndarray,
++    class_names: Sequence[str] | None = None,
++) -> dict[str, Any]:
++    """Evaluate the BiomedCoOp-compatible single-label protocol."""
++    scores = _as_2d_float(scores, "scores")
++    target = np.asarray(y_true)
++
++    if target.ndim == 2:
++        if target.shape != scores.shape:
++            raise ValueError(
++                "One-hot y_true must have the same shape as scores, got "
++                f"{target.shape} and {scores.shape}"
++            )
++        if not np.all(target.sum(axis=1) == 1):
++            raise ValueError("Single-label evaluation requires one positive class per row")
++        target_index = target.argmax(axis=1)
++    elif target.ndim == 1:
++        target_index = target.astype(np.int64)
++    else:
++        raise ValueError("y_true must be a 1-D index vector or 2-D one-hot matrix")
++
++    n_classes = scores.shape[1]
++    if class_names is None:
++        class_names = [str(index) for index in range(n_classes)]
++    if len(class_names) != n_classes:
++        raise ValueError("class_names length must match the number of classes")
++
++    prediction = scores.argmax(axis=1)
++    labels = np.arange(n_classes)
++    matrix = confusion_matrix(target_index, prediction, labels=labels)
++    normalised = confusion_matrix(
++        target_index,
++        prediction,
++        labels=labels,
++        normalize="true",
++    )
++
++    per_class_accuracy = {}
++    for index, class_name in enumerate(class_names):
++        class_total = matrix[index].sum()
++        per_class_accuracy[str(class_name)] = (
++            float(matrix[index, index] / class_total) if class_total else None
++        )
++
++    accuracy = float(accuracy_score(target_index, prediction))
++    return {
++        "accuracy": accuracy,
++        "error_rate": 1.0 - accuracy,
++        "macro_f1": float(
++            f1_score(
++                target_index,
++                prediction,
++                labels=labels,
++                average="macro",
++                zero_division=0,
++            )
++        ),
++        "balanced_accuracy": float(
++            balanced_accuracy_score(target_index, prediction)
++        ),
++        "per_class_accuracy": per_class_accuracy,
++        "confusion_matrix": matrix.tolist(),
++        "confusion_matrix_normalized": normalised.tolist(),
++    }
++
++
++def print_metrics(metrics: dict[str, Any], task: str) -> None:
++    """Print the common headline metrics in a stable format."""
++    if task == "single":
++        print(f"accuracy          : {metrics['accuracy']:.4f}")
++        print(f"error rate        : {metrics['error_rate']:.4f}")
++        print(f"macro F1          : {metrics['macro_f1']:.4f}")
++        print(f"balanced accuracy : {metrics['balanced_accuracy']:.4f}")
++        for class_name, value in metrics["per_class_accuracy"].items():
++            text = "nan" if value is None else f"{value:.4f}"
++            print(f"  {class_name:5s} accuracy: {text}")
++        return
++
++    for key, label in (
++        ("macro_auroc", "macro AUROC"),
++        ("micro_auroc", "micro AUROC"),
++        ("macro_auprc", "macro AUPRC"),
++        ("micro_auprc", "micro AUPRC"),
++        ("macro_f1", "macro F1"),
++        ("micro_f1", "micro F1"),
++        ("top1_hit_accuracy", "top-1 hit acc"),
++    ):
++        print(f"{label:16s}: {metrics[key]:.4f}")
++
++    print("per-class metrics:")
++    for class_name, values in metrics["per_class"].items():
++        auroc = values["auroc"]
++        auprc = values["auprc"]
++        auroc_text = "nan" if auroc is None else f"{auroc:.4f}"
++        auprc_text = "nan" if auprc is None else f"{auprc:.4f}"
++        print(
++            f"  {class_name:5s} AUROC={auroc_text} AUPRC={auprc_text} "
++            f"F1={values['f1']:.4f} sens={values['sensitivity']:.4f} "
++            f"spec={values['specificity']:.4f} "
++            f"thr={values['threshold']:.4f}"
++        )
++
++
++def _json_safe(value: Any) -> Any:
++    if isinstance(value, dict):
++        return {str(key): _json_safe(item) for key, item in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [_json_safe(item) for item in value]
++    if isinstance(value, np.ndarray):
++        return _json_safe(value.tolist())
++    if isinstance(value, np.generic):
++        return _json_safe(value.item())
++    if isinstance(value, float) and not np.isfinite(value):
++        return None
++    return value
++
++
++def save_result(
++    path: str | Path,
++    metrics: dict[str, Any],
++    metadata: dict[str, Any],
++) -> Path:
++    """Save metrics and experiment metadata as standards-compliant JSON."""
++    output_path = Path(path)
++    output_path.parent.mkdir(parents=True, exist_ok=True)
++    payload = {
++        "metadata": _json_safe(metadata),
++        "metrics": _json_safe(metrics),
++    }
++    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
++    return output_path
+diff --git a/linear_probe.py b/linear_probe.py
+index 96901bc..a4d0792 100644
+--- a/linear_probe.py
++++ b/linear_probe.py
+@@ -1,103 +1,197 @@
+-"""
+-Linear probe: train a small linear classifier on top of FROZEN BiomedCLIP
+-image features. This is the cheapest way to "train on this dataset" and a
+-standard way to measure how transferable a foundation model's features are.
++"""Train and evaluate a multi-label linear probe on frozen ECG embeddings."""
++from __future__ import annotations
+ 
+-Prereq: run extract_features.py first.
+-
+-    python linear_probe.py
+-
+-Multi-label task (5 superclasses) -> BCEWithLogitsLoss, macro AUROC for model
+-selection on the validation fold, final report on the test fold.
+-"""
++import argparse
+ import os
++import random
++from pathlib import Path
+ 
+ import numpy as np
+ import torch
+ import torch.nn as nn
+-from sklearn.metrics import roc_auc_score
+ 
+ import config as C
++from evaluation import (
++    evaluate_multilabel,
++    print_metrics,
++    save_result,
++    tune_multilabel_thresholds,
++)
+ 
+ 
+ def load_split(name):
+-    X = np.load(os.path.join(C.FEAT_DIR, f"X_{name}.npy"))
+-    y = np.load(os.path.join(C.FEAT_DIR, f"y_{name}.npy"))
+-    return torch.from_numpy(X), torch.from_numpy(y)
++    features = np.load(os.path.join(C.FEAT_DIR, f"X_{name}.npy"))
++    labels = np.load(os.path.join(C.FEAT_DIR, f"y_{name}.npy"))
++    return torch.from_numpy(features), torch.from_numpy(labels)
+ 
+ 
+-def macro_auroc(y_true, y_score):
+-    aucs = []
+-    for i in range(y_true.shape[1]):
+-        col = y_true[:, i]
+-        if 0 < col.sum() < len(col):
+-            aucs.append(roc_auc_score(col, y_score[:, i]))
+-    return float(np.mean(aucs)) if aucs else float("nan")
++def set_seed(seed):
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(seed)
+ 
+ 
+ def main():
+-    torch.manual_seed(C.SEED)
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--seed", type=int, default=C.SEED)
++    parser.add_argument(
++        "--threshold-mode",
++        choices=["per-class", "global", "fixed"],
++        default="per-class",
++    )
++    parser.add_argument("--threshold", type=float, default=0.5)
++    parser.add_argument("--results-dir", default=os.path.join(C.WORK_DIR, "results"))
++    args = parser.parse_args()
++
++    set_seed(args.seed)
+     device = "cuda" if torch.cuda.is_available() else "cpu"
+ 
+-    Xtr, ytr = load_split("train")
+-    Xva, yva = load_split("val")
+-    Xte, yte = load_split("test")
+-    dim, n_cls = Xtr.shape[1], ytr.shape[1]
+-    print(f"feature dim {dim} | classes {n_cls} | "
+-          f"train {len(Xtr)} val {len(Xva)} test {len(Xte)}")
+-
+-    # Standardise features (helps linear models converge).
+-    mu, sd = Xtr.mean(0, keepdim=True), Xtr.std(0, keepdim=True) + 1e-6
+-    Xtr, Xva, Xte = (Xtr - mu) / sd, (Xva - mu) / sd, (Xte - mu) / sd
+-
+-    clf = nn.Linear(dim, n_cls).to(device)
+-    opt = torch.optim.AdamW(clf.parameters(), lr=C.LP_LR,
+-                            weight_decay=C.LP_WEIGHT_DECAY)
+-    # class imbalance -> positive weighting
+-    pos = ytr.sum(0)
+-    neg = len(ytr) - pos
+-    pos_weight = (neg / pos.clamp(min=1)).to(device)
+-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+-
+-    Xtr, ytr = Xtr.to(device), ytr.to(device)
+-    Xva_d, Xte_d = Xva.to(device), Xte.to(device)
+-
+-    best_auc, best_state = -1.0, None
+-    n = len(Xtr)
++    train_features, train_labels = load_split("train")
++    val_features, val_labels = load_split("val")
++    test_features, test_labels = load_split("test")
++    feature_dim = train_features.shape[1]
++    n_classes = train_labels.shape[1]
++    print(
++        f"feature dim {feature_dim} | classes {n_classes} | "
++        f"train {len(train_features)} val {len(val_features)} "
++        f"test {len(test_features)} | seed {args.seed}"
++    )
++
++    mean = train_features.mean(0, keepdim=True)
++    std = train_features.std(0, keepdim=True) + 1e-6
++    train_features = (train_features - mean) / std
++    val_features = (val_features - mean) / std
++    test_features = (test_features - mean) / std
++
++    classifier = nn.Linear(feature_dim, n_classes).to(device)
++    optimizer = torch.optim.AdamW(
++        classifier.parameters(),
++        lr=C.LP_LR,
++        weight_decay=C.LP_WEIGHT_DECAY,
++    )
++
++    positive = train_labels.sum(0)
++    negative = len(train_labels) - positive
++    positive_weight = (negative / positive.clamp(min=1)).to(device)
++    loss_function = nn.BCEWithLogitsLoss(pos_weight=positive_weight)
++
++    train_features = train_features.to(device)
++    train_labels_device = train_labels.to(device)
++    val_features_device = val_features.to(device)
++    test_features_device = test_features.to(device)
++
++    best_auroc = -float("inf")
++    best_state = None
++    generator = torch.Generator(device=device if device == "cuda" else "cpu")
++    generator.manual_seed(args.seed)
++
+     for epoch in range(C.LP_EPOCHS):
+-        clf.train()
+-        perm = torch.randperm(n, device=device)
+-        for i in range(0, n, C.BATCH_SIZE):
+-            idx = perm[i:i + C.BATCH_SIZE]
+-            opt.zero_grad()
+-            loss = loss_fn(clf(Xtr[idx]), ytr[idx])
++        classifier.train()
++        permutation = torch.randperm(
++            len(train_features),
++            generator=generator,
++            device=device,
++        )
++        for start in range(0, len(train_features), C.BATCH_SIZE):
++            indices = permutation[start : start + C.BATCH_SIZE]
++            optimizer.zero_grad()
++            logits = classifier(train_features[indices])
++            loss = loss_function(logits, train_labels_device[indices])
+             loss.backward()
+-            opt.step()
++            optimizer.step()
+ 
+-        clf.eval()
++        classifier.eval()
+         with torch.no_grad():
+-            va_score = torch.sigmoid(clf(Xva_d)).cpu().numpy()
+-        auc = macro_auroc(yva.numpy(), va_score)
+-        if auc > best_auc:
+-            best_auc = auc
+-            best_state = {k: v.detach().clone() for k, v in clf.state_dict().items()}
+-        if epoch % 5 == 0 or epoch == C.LP_EPOCHS - 1:
+-            print(f"epoch {epoch:3d}  val macro AUROC {auc:.4f}  (best {best_auc:.4f})")
++            val_logits = classifier(val_features_device).cpu().numpy()
++            val_probabilities = torch.sigmoid(
++                torch.from_numpy(val_logits)
++            ).numpy()
++
++        validation_metrics = evaluate_multilabel(
++            val_logits,
++            val_labels.numpy(),
++            val_probabilities,
++            thresholds=args.threshold,
++            class_names=C.CLASSES,
++        )
++        validation_auroc = validation_metrics["macro_auroc"]
++        if np.isfinite(validation_auroc) and validation_auroc > best_auroc:
++            best_auroc = validation_auroc
++            best_state = {
++                key: value.detach().cpu().clone()
++                for key, value in classifier.state_dict().items()
++            }
+ 
+-    clf.load_state_dict(best_state)
+-    clf.eval()
+-    with torch.no_grad():
+-        te_score = torch.sigmoid(clf(Xte_d)).cpu().numpy()
+-    yte_np = yte.numpy()
++        if epoch % 5 == 0 or epoch == C.LP_EPOCHS - 1:
++            print(
++                f"epoch {epoch:3d} val macro AUROC {validation_auroc:.4f} "
++                f"(best {best_auroc:.4f})"
++            )
+ 
+-    print("\n=== Linear probe on frozen BiomedCLIP features (test fold) ===")
+-    print(f"macro AUROC : {macro_auroc(yte_np, te_score):.4f}")
+-    for i, c in enumerate(C.CLASSES):
+-        if 0 < yte_np[:, i].sum() < len(yte_np):
+-            print(f"   {c:5s} AUROC: {roc_auc_score(yte_np[:, i], te_score[:, i]):.4f}")
++    if best_state is None:
++        raise RuntimeError("No valid validation AUROC was produced")
+ 
+-    torch.save(clf.state_dict(), os.path.join(C.CKPT_DIR, "linear_probe.pt"))
+-    print(f"Saved linear head -> {os.path.join(C.CKPT_DIR, 'linear_probe.pt')}")
++    classifier.load_state_dict(best_state)
++    classifier.eval()
++    with torch.no_grad():
++        val_logits = classifier(val_features_device).cpu().numpy()
++        test_logits = classifier(test_features_device).cpu().numpy()
++
++    val_probabilities = torch.sigmoid(torch.from_numpy(val_logits)).numpy()
++    test_probabilities = torch.sigmoid(torch.from_numpy(test_logits)).numpy()
++    thresholds = tune_multilabel_thresholds(
++        val_labels.numpy(),
++        val_probabilities,
++        mode=args.threshold_mode,
++        fixed_threshold=args.threshold,
++    )
++    metrics = evaluate_multilabel(
++        test_logits,
++        test_labels.numpy(),
++        test_probabilities,
++        thresholds=thresholds,
++        class_names=C.CLASSES,
++    )
++
++    print("\n=== Linear probe on frozen BiomedCLIP features: test fold ===")
++    print_metrics(metrics, "multi")
++
++    checkpoint_path = Path(C.CKPT_DIR) / f"linear_probe_seed{args.seed}.pt"
++    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
++    torch.save(
++        {
++            "state_dict": best_state,
++            "feature_mean": mean,
++            "feature_std": std,
++            "classes": list(C.CLASSES),
++            "seed": args.seed,
++            "best_validation_macro_auroc": best_auroc,
++        },
++        checkpoint_path,
++    )
++    print(f"Saved linear head -> {checkpoint_path}")
++
++    result_path = Path(args.results_dir) / f"linear_probe_multi_seed{args.seed}.json"
++    save_result(
++        result_path,
++        metrics,
++        metadata={
++            "method": "linear_probe",
++            "task": "multi",
++            "shots": 0,
++            "seed": args.seed,
++            "checkpoint": str(checkpoint_path),
++            "classes": list(C.CLASSES),
++            "threshold_mode": args.threshold_mode,
++            "fixed_threshold": args.threshold,
++            "thresholds": thresholds.tolist(),
++            "validation_fold": C.VAL_FOLD,
++            "test_fold": C.TEST_FOLD,
++        },
++    )
++    print(f"Saved metrics -> {result_path}")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/run_fewshot_evaluation.sh b/run_fewshot_evaluation.sh
+new file mode 100755
+index 0000000..c877904
+--- /dev/null
++++ b/run_fewshot_evaluation.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Official-style BiomedCoOp comparison: single-label accuracy across K shots.
++for shots in 1 2 4 8 16; do
++  for seed in 1 2 3; do
++    python train_biomedcoop.py \
++      --task single \
++      --shots "${shots}" \
++      --seed "${seed}"
++  done
++done
++
++# Native PTB-XL multi-label comparison.
++for shots in 1 2 4 8 16; do
++  for seed in 1 2 3; do
++    python train_biomedcoop.py \
++      --task multi \
++      --shots "${shots}" \
++      --seed "${seed}" \
++      --threshold-mode per-class
++  done
++done
++
++python aggregate_results.py \
++  --pattern 'work/results/biomedcoop_*.json' \
++  --output work/results/biomedcoop_summary.csv
+diff --git a/train_biomedcoop.py b/train_biomedcoop.py
+index 1e7939a..fb18307 100644
+--- a/train_biomedcoop.py
++++ b/train_biomedcoop.py
+@@ -1,292 +1,533 @@
+-"""
+-Train BiomedCoOp prompts on PTB-XL (few-shot OR full), then evaluate.
+-
+-Prereqs (already in your repo):
+-    python prepare_data.py          # writes work/labels.csv + work/images/*.png
+-
+-Examples
+---------
+-# 16-shot few-shot, multi-label (matches your macro-AUROC pipeline), seed 1
+-python train_biomedcoop.py --shots 16 --seed 1
+-
+-# full training on all of folds 1-8 (multi-label)
+-python train_biomedcoop.py --shots 0 --epochs 20 --batch-size 32
+-
+-# faithful single-label reproduction (uses only single-superclass records)
+-python train_biomedcoop.py --shots 16 --task single
++"""Train BiomedCoOp prompts on PTB-XL and evaluate consistently.
+ 
+-# evaluate a saved prompt checkpoint only
+-python train_biomedcoop.py --eval-only --ckpt work/checkpoints/biomedcoop_multi_16shot_seed1.pt
++Examples:
++    python train_biomedcoop.py --shots 16 --seed 1 --task multi
++    python train_biomedcoop.py --shots 16 --seed 1 --task single
++    python train_biomedcoop.py --eval-only \
++        --ckpt work/checkpoints/biomedcoop_multi_16shot_seed1.pt
+ 
+-Outputs a prompt checkpoint in work/checkpoints/ and prints test metrics
+-(macro AUROC, per-class AUROC, macro/micro F1) using the same evaluate() as
+-zero_shot_eval.py, so results are directly comparable to your baselines.
++Single-label mode follows the official BiomedCoOp-style argmax evaluation.
++Multi-label mode reports AUROC, AUPRC, and validation-tuned F1 metrics.
+ """
++from __future__ import annotations
++
+ import argparse
+ import math
+ import os
++import random
++from pathlib import Path
+ 
+ import numpy as np
+ import pandas as pd
+ import torch
+ from PIL import Image
+-from torch.utils.data import Dataset, DataLoader
++from torch.utils.data import DataLoader, Dataset
+ from tqdm import tqdm
+ 
+ import config as C
+-from model_utils import load_biomedclip, get_device
+-from prepare_data import image_path_for
+-from zero_shot_eval import evaluate                       # reuse your metrics
+-from ecg_prompts import get_templates, readable_name
+ from biomedcoop import build_biomedcoop
++from ecg_prompts import get_templates, readable_name
++from evaluation import (
++    evaluate_multilabel,
++    evaluate_single_label,
++    print_metrics,
++    save_result,
++    tune_multilabel_thresholds,
++)
++from model_utils import get_device, load_biomedclip
++from prepare_data import image_path_for
+ 
+ 
+-# ---------------------------------------------------------------------------
+-# Data
+-# ---------------------------------------------------------------------------
+ class ECGImageDataset(Dataset):
+-    """Returns (preprocessed_image, multi_hot_label_vector)."""
++    """Return a preprocessed ECG image and its multi-hot label vector."""
+ 
+     def __init__(self, df, preprocess):
+-        self.df = df
+         self.preprocess = preprocess
+         self.ids = df.index.tolist()
+-        self.Y = df[C.CLASSES].values.astype(np.float32)
++        self.labels = df[C.CLASSES].values.astype(np.float32)
+ 
+     def __len__(self):
+         return len(self.ids)
+ 
+-    def __getitem__(self, i):
+-        img = Image.open(image_path_for(self.ids[i])).convert("RGB")
+-        return self.preprocess(img), torch.from_numpy(self.Y[i])
++    def __getitem__(self, index):
++        image = Image.open(image_path_for(self.ids[index])).convert("RGB")
++        return self.preprocess(image), torch.from_numpy(self.labels[index])
++
++
++def set_seed(seed: int) -> None:
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(seed)
++
++
++def single_label_subset(df: pd.DataFrame) -> pd.DataFrame:
++    return df.loc[df[C.CLASSES].values.sum(axis=1) == 1]
+ 
+ 
+ def few_shot_subset(df, shots, seed, task):
+-    """Sample `shots` examples per class. shots=0 -> use the whole df.
++    """Sample K positive examples per class from the training folds.
+ 
+-    multi-label: union of `shots` positive records per class (deduplicated).
+-    single-label: restrict to single-superclass records, `shots` per class.
++    For ``task='single'`` the records are first restricted to exactly one
++    superclass. For ``task='multi'`` the union is deduplicated, so the total
++    number of records can be smaller than ``K * n_classes``.
+     """
+     if task == "single":
+-        keep = df[C.CLASSES].values.sum(axis=1) == 1
+-        df = df[keep]
++        df = single_label_subset(df)
+     if shots == 0:
+         return df
+-    rng = np.random.RandomState(seed)
+-    chosen = set()
+-    for ci, c in enumerate(C.CLASSES):
+-        pos = df.index[df[c].values.astype(bool)].tolist()
+-        rng.shuffle(pos)
+-        for ecg_id in pos[:shots]:
+-            chosen.add(ecg_id)
+-    return df.loc[sorted(chosen)]
+-
+-
+-def multi_hot_to_single(Y):
+-    """For single-label mode: argmax of the (guaranteed one-hot) label rows."""
+-    return Y.argmax(dim=1)
+ 
+-
+-# ---------------------------------------------------------------------------
+-# LR schedule: 1-epoch constant warmup then cosine (matches the paper config)
+-# ---------------------------------------------------------------------------
+-def make_scheduler(optimizer, max_epoch, warmup_epoch=1, warmup_lr=1e-5, base_lr=0.0025):
++    rng = np.random.RandomState(seed)
++    selected = set()
++    for class_name in C.CLASSES:
++        positive_ids = df.index[df[class_name].values.astype(bool)].tolist()
++        rng.shuffle(positive_ids)
++        if len(positive_ids) < shots:
++            raise ValueError(
++                f"Class {class_name} has only {len(positive_ids)} eligible "
++                f"records, fewer than --shots={shots}"
++            )
++        selected.update(positive_ids[:shots])
++
++    return df.loc[sorted(selected)]
++
++
++def multi_hot_to_single(labels):
++    return labels.argmax(dim=1)
++
++
++def make_scheduler(
++    optimizer,
++    max_epoch,
++    warmup_epoch=1,
++    warmup_lr=1e-5,
++    base_lr=0.0025,
++):
+     def lr_lambda(epoch):
+         if epoch < warmup_epoch:
+             return warmup_lr / base_lr
+-        t = (epoch - warmup_epoch) / max(1, (max_epoch - warmup_epoch))
+-        return 0.5 * (1.0 + math.cos(math.pi * t))
++        progress = (epoch - warmup_epoch) / max(1, max_epoch - warmup_epoch)
++        return 0.5 * (1.0 + math.cos(math.pi * progress))
++
+     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+ 
+ 
+-# ---------------------------------------------------------------------------
+-# Evaluation over a dataframe
+-# ---------------------------------------------------------------------------
+ @torch.no_grad()
+ def score_split(model, df, preprocess, device, batch_size, task):
++    """Return ranking scores, probabilities, and labels for a dataframe."""
+     model.eval()
+-    ds = ECGImageDataset(df, preprocess)
+-    dl = DataLoader(ds, batch_size=batch_size, shuffle=False,
+-                    num_workers=C.NUM_WORKERS)
+-    # text features once (prompt is fixed at eval time)
++    dataset = ECGImageDataset(df, preprocess)
++    loader = DataLoader(
++        dataset,
++        batch_size=batch_size,
++        shuffle=False,
++        num_workers=C.NUM_WORKERS,
++    )
++
+     text_features = model.prompt_learner()
+     text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+ 
+-    all_scores, all_labels = [], []
+-    for images, labels in dl:
++    all_ranking_scores = []
++    all_probabilities = []
++    all_labels = []
++
++    for images, labels in loader:
+         images = images.to(device)
+-        img_f = model.image_encoder(images.type(model.dtype))
+-        img_f = img_f / img_f.norm(dim=-1, keepdim=True)
++        image_features = model.image_encoder(images.type(model.dtype))
++        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
++        cosine = image_features @ text_features.t()
++
+         if task == "single":
+-            logits = model.logit_scale.exp() * img_f @ text_features.t()
+-            scores = logits.softmax(dim=-1)
++            logits = model.logit_scale.exp() * cosine
++            probabilities = logits.softmax(dim=-1)
++            ranking_scores = probabilities
+         else:
+-            s = (img_f @ text_features.t()) / model.ml_temperature
+-            scores = torch.sigmoid(s)
+-        all_scores.append(scores.cpu().numpy())
++            probabilities = torch.sigmoid(cosine / model.ml_temperature)
++            ranking_scores = cosine
++
++        all_ranking_scores.append(ranking_scores.cpu().numpy())
++        all_probabilities.append(probabilities.cpu().numpy())
+         all_labels.append(labels.numpy())
+-    return np.concatenate(all_scores), np.concatenate(all_labels).astype(int)
++
++    return (
++        np.concatenate(all_ranking_scores),
++        np.concatenate(all_probabilities),
++        np.concatenate(all_labels).astype(int),
++    )
++
++
++def evaluate_test(
++    task,
++    val_ranking,
++    val_probabilities,
++    val_labels,
++    test_ranking,
++    test_probabilities,
++    test_labels,
++    threshold_mode,
++    fixed_threshold,
++):
++    if task == "single":
++        metrics = evaluate_single_label(
++            test_probabilities,
++            test_labels,
++            class_names=C.CLASSES,
++        )
++        return metrics, None
++
++    thresholds = tune_multilabel_thresholds(
++        val_labels,
++        val_probabilities,
++        mode=threshold_mode,
++        fixed_threshold=fixed_threshold,
++    )
++    metrics = evaluate_multilabel(
++        test_ranking,
++        test_labels,
++        test_probabilities,
++        thresholds=thresholds,
++        class_names=C.CLASSES,
++    )
++    return metrics, thresholds
++
++
++def checkpoint_name(args) -> str:
++    full = args.shots == 0
++    suffix = "full" if full else f"{args.shots}shot"
++    return args.ckpt or os.path.join(
++        C.CKPT_DIR,
++        f"biomedcoop_{args.task}_{suffix}_seed{args.seed}.pt",
++    )
++
++
++def apply_checkpoint_configuration(args, state):
++    """Use saved architecture metadata during --eval-only.
++
++    This avoids silently building a prompt learner with a different task,
++    number of context tokens, or CSC shape before copying the learned tensor.
++    Older checkpoints remain supported through defaults.
++    """
++    args.task = state.get("task", args.task)
++    args.n_ctx = int(state.get("n_ctx", args.n_ctx))
++    args.csc = bool(state.get("csc", args.csc))
++    args.ctx_init = state.get("ctx_init", args.ctx_init)
++    args.ml_temperature = float(
++        state.get("ml_temperature", args.ml_temperature)
++    )
++    args.shots = int(state.get("shots", args.shots))
++    args.seed = int(state.get("seed", args.seed))
++
++    saved_classes = state.get("classes")
++    if saved_classes is not None and list(saved_classes) != list(C.CLASSES):
++        raise ValueError(
++            f"Checkpoint classes {saved_classes} do not match config classes "
++            f"{C.CLASSES}"
++        )
+ 
+ 
+-# ---------------------------------------------------------------------------
+-# Main
+-# ---------------------------------------------------------------------------
+ def main():
+-    ap = argparse.ArgumentParser()
+-    ap.add_argument("--shots", type=int, default=16,
+-                    help="examples per class; 0 = full training on folds 1-8")
+-    ap.add_argument("--task", choices=["multi", "single"], default="multi")
+-    ap.add_argument("--seed", type=int, default=1)
+-    ap.add_argument("--epochs", type=int, default=None,
+-                    help="default 100 for few-shot, 20 for full")
+-    ap.add_argument("--batch-size", type=int, default=None,
+-                    help="default 4 for few-shot, 32 for full")
+-    ap.add_argument("--lr", type=float, default=0.0025)
+-    ap.add_argument("--n-ctx", type=int, default=4)
+-    ap.add_argument("--ctx-init", type=str, default="a photo of a")
+-    ap.add_argument("--csc", action="store_true", help="class-specific context")
+-    ap.add_argument("--n-prompts", type=int, default=30)
+-    ap.add_argument("--tau", type=float, default=1.5)
+-    ap.add_argument("--sccm-lambda", type=float, default=0.5)
+-    ap.add_argument("--kdsp-lambda", type=float, default=0.25)
+-    ap.add_argument("--ml-temperature", type=float, default=0.5,
+-                    help="temperature for the multi-label BCE/KDSP logits")
+-    ap.add_argument("--limit", type=int, default=None, help="debug: cap records")
+-    ap.add_argument("--eval-only", action="store_true")
+-    ap.add_argument("--ckpt", type=str, default=None)
+-    args = ap.parse_args()
+-
+-    full = (args.shots == 0)
++    parser = argparse.ArgumentParser()
++    parser.add_argument(
++        "--shots",
++        type=int,
++        default=16,
++        help="examples per class; 0 uses all records in folds 1-8",
++    )
++    parser.add_argument("--task", choices=["multi", "single"], default="multi")
++    parser.add_argument("--seed", type=int, default=1)
++    parser.add_argument("--epochs", type=int, default=None)
++    parser.add_argument("--batch-size", type=int, default=None)
++    parser.add_argument("--lr", type=float, default=0.0025)
++    parser.add_argument("--n-ctx", type=int, default=4)
++    parser.add_argument("--ctx-init", type=str, default="a photo of a")
++    parser.add_argument("--csc", action="store_true", help="class-specific context")
++    parser.add_argument("--n-prompts", type=int, default=30)
++    parser.add_argument("--tau", type=float, default=1.5)
++    parser.add_argument("--sccm-lambda", type=float, default=0.5)
++    parser.add_argument("--kdsp-lambda", type=float, default=0.25)
++    parser.add_argument("--ml-temperature", type=float, default=0.5)
++    parser.add_argument("--limit", type=int, default=None)
++    parser.add_argument("--eval-only", action="store_true")
++    parser.add_argument("--ckpt", type=str, default=None)
++    parser.add_argument(
++        "--threshold-mode",
++        choices=["per-class", "global", "fixed"],
++        default="per-class",
++    )
++    parser.add_argument("--threshold", type=float, default=0.5)
++    parser.add_argument("--results-dir", default=os.path.join(C.WORK_DIR, "results"))
++    args = parser.parse_args()
++
++    if args.shots < 0:
++        raise ValueError("--shots must be non-negative")
++    if args.ml_temperature <= 0:
++        raise ValueError("--ml-temperature must be positive")
++
++    ckpt_path = checkpoint_name(args)
++    checkpoint_state = None
++    if args.eval_only:
++        checkpoint_state = torch.load(ckpt_path, map_location="cpu")
++        apply_checkpoint_configuration(args, checkpoint_state)
++
++    full = args.shots == 0
+     epochs = args.epochs if args.epochs is not None else (20 if full else 100)
+-    batch_size = args.batch_size if args.batch_size is not None else (32 if full else 4)
++    batch_size = (
++        args.batch_size if args.batch_size is not None else (32 if full else 4)
++    )
+ 
+-    torch.manual_seed(args.seed)
+-    np.random.seed(args.seed)
++    set_seed(args.seed)
+     device = get_device()
+-    print(f"Device: {device} | task={args.task} | shots={args.shots} "
+-          f"({'FULL' if full else 'few-shot'}) | epochs={epochs} bs={batch_size}")
++    print(
++        f"Device: {device} | task={args.task} | shots={args.shots} | "
++        f"epochs={epochs} | batch_size={batch_size} | seed={args.seed}"
++    )
+ 
+-    # ---- model + tokenizer -------------------------------------------------
+     clip_model, preprocess, tokenizer = load_biomedclip(device)
+-    clip_model = clip_model.float()      # prompt tuning is done in fp32
+-    for p in clip_model.parameters():
+-        p.requires_grad_(False)
++    clip_model = clip_model.float()
++    for parameter in clip_model.parameters():
++        parameter.requires_grad_(False)
+ 
+-    classnames = [readable_name(c) for c in C.CLASSES]
++    classnames = [readable_name(class_name) for class_name in C.CLASSES]
+     class_templates = get_templates(C.CLASSES, args.n_prompts)
+-
+     model = build_biomedcoop(
+-        clip_model, tokenizer, classnames, class_templates, device,
+-        task=args.task, n_ctx=args.n_ctx, ctx_init=args.ctx_init, csc=args.csc,
+-        sccm_lambda=args.sccm_lambda, kdsp_lambda=args.kdsp_lambda, tau=args.tau,
+-        context_length=C.CONTEXT_LENGTH, ml_temperature=args.ml_temperature,
++        clip_model,
++        tokenizer,
++        classnames,
++        class_templates,
++        device,
++        task=args.task,
++        n_ctx=args.n_ctx,
++        ctx_init=args.ctx_init,
++        csc=args.csc,
++        sccm_lambda=args.sccm_lambda,
++        kdsp_lambda=args.kdsp_lambda,
++        tau=args.tau,
++        context_length=C.CONTEXT_LENGTH,
++        ml_temperature=args.ml_temperature,
+     )
+ 
+-    # ---- data --------------------------------------------------------------
+-    labels_df = pd.read_csv(os.path.join(C.WORK_DIR, "labels.csv"),
+-                            index_col="ecg_id")
++    labels_df = pd.read_csv(
++        os.path.join(C.WORK_DIR, "labels.csv"),
++        index_col="ecg_id",
++    )
+     if args.limit:
+-        labels_df = labels_df.iloc[:args.limit]
++        labels_df = labels_df.iloc[: args.limit]
++
+     train_df = labels_df[labels_df.strat_fold.isin(C.TRAIN_FOLDS)]
+     val_df = labels_df[labels_df.strat_fold == C.VAL_FOLD]
+     test_df = labels_df[labels_df.strat_fold == C.TEST_FOLD]
+-    if args.task == "single":  # eval single-label too for a fair comparison
+-        val_df = val_df[val_df[C.CLASSES].values.sum(1) == 1]
+-        test_df = test_df[test_df[C.CLASSES].values.sum(1) == 1]
+ 
+-    train_sub = few_shot_subset(train_df, args.shots, args.seed, args.task)
+-    print(f"Train records used: {len(train_sub)} | val {len(val_df)} | test {len(test_df)}")
+-    for c in C.CLASSES:
+-        print(f"   {c:5s} train-pos: {int(train_sub[c].sum())}")
++    if args.task == "single":
++        val_df = single_label_subset(val_df)
++        test_df = single_label_subset(test_df)
+ 
+-    ckpt_name = (args.ckpt or os.path.join(
+-        C.CKPT_DIR,
+-        f"biomedcoop_{args.task}_{'full' if full else str(args.shots)+'shot'}_seed{args.seed}.pt"))
++    train_subset = (
++        train_df
++        if args.eval_only
++        else few_shot_subset(train_df, args.shots, args.seed, args.task)
++    )
++    print(
++        f"Train records used: {len(train_subset)} | "
++        f"validation: {len(val_df)} | test: {len(test_df)}"
++    )
++    for class_name in C.CLASSES:
++        print(f"  {class_name:5s} train positives: {int(train_subset[class_name].sum())}")
+ 
+-    # ---- eval-only ---------------------------------------------------------
+     if args.eval_only:
+-        state = torch.load(ckpt_name, map_location=device)
+-        model.prompt_learner.ctx.data.copy_(state["ctx"].to(device))
+-        scores, labels = score_split(model, test_df, preprocess, device, batch_size, args.task)
+-        report(scores, labels, args.task)
+-        return
+-
+-    # ---- multi-label positive weighting -----------------------------------
+-    if args.task == "multi":
+-        Ytr = train_sub[C.CLASSES].values
+-        pos = Ytr.sum(0)
+-        neg = len(Ytr) - pos
+-        pos_weight = torch.tensor(neg / np.clip(pos, 1, None), dtype=torch.float32)
+-        model.set_pos_weight(pos_weight)
+-
+-    # ---- optimizer / schedule (SGD + cosine, per the paper) ---------------
+-    ctx = model.prompt_learner.ctx
+-    optim = torch.optim.SGD([ctx], lr=args.lr, momentum=0.9, weight_decay=5e-4)
+-    sched = make_scheduler(optim, epochs, base_lr=args.lr)
+-
+-    ds = ECGImageDataset(train_sub, preprocess)
+-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=full,
+-                    num_workers=C.NUM_WORKERS)
+-
+-    def selection_metric(scores, labels):
+-        # macro AUROC (multi) / accuracy (single) on the val fold
+-        if args.task == "single":
+-            return float((scores.argmax(1) == labels.argmax(1)).mean())
+-        m = evaluate(scores, labels)
+-        return m["macro_auroc"]
+-
+-    best_metric, best_ctx = -1.0, None
+-    for epoch in range(epochs):
+-        model.prompt_learner.train()
+-        running = 0.0
+-        pbar = tqdm(dl, desc=f"epoch {epoch+1}/{epochs}")
+-        for images, labels in pbar:
+-            images = images.to(device)
+-            labels = labels.to(device)
+-            target = multi_hot_to_single(labels) if args.task == "single" else labels
+-            logits, loss_ce, loss_sccm, loss_kdsp = model(images, target)
+-            loss = loss_ce + loss_sccm + loss_kdsp
+-            optim.zero_grad()
+-            loss.backward()
+-            optim.step()
+-            running += loss.item()
+-            pbar.set_postfix(loss=f"{loss.item():.3f}",
+-                             ce=f"{loss_ce.item():.3f}",
+-                             sccm=f"{loss_sccm.item():.3f}",
+-                             kdsp=f"{loss_kdsp.item():.3f}")
+-        sched.step()
+-
+-        val_scores, val_labels = score_split(model, val_df, preprocess, device,
+-                                              batch_size, args.task)
+-        metric = selection_metric(val_scores, val_labels)
+-        tag = "acc" if args.task == "single" else "macroAUROC"
+-        print(f"epoch {epoch+1}: train loss {running/len(dl):.4f} | val {tag} {metric:.4f}")
+-        if metric > best_metric:
+-            best_metric = metric
+-            best_ctx = ctx.detach().clone()
+-
+-    # ---- save best + final test report ------------------------------------
+-    model.prompt_learner.ctx.data.copy_(best_ctx)
+-    torch.save({"ctx": best_ctx.cpu(),
+-                "task": args.task, "n_ctx": args.n_ctx,
+-                "classes": C.CLASSES}, ckpt_name)
+-    print(f"\nSaved prompt checkpoint -> {ckpt_name} (best val {tag} {best_metric:.4f})")
+-
+-    scores, labels = score_split(model, test_df, preprocess, device, batch_size, args.task)
+-    report(scores, labels, args.task)
+-
+-
+-def report(scores, labels, task):
+-    print(f"\n=== BiomedCoOp on PTB-XL (test fold, task={task}) ===")
+-    if task == "single":
+-        acc = float((scores.argmax(1) == labels.argmax(1)).mean())
+-        print(f"accuracy   : {acc:.4f}")
+-    m = evaluate(scores, labels)
+-    print(f"macro AUROC : {m['macro_auroc']:.4f}")
+-    for c, a in m["per_class_auroc"].items():
+-        print(f"   {c:5s} AUROC: {a:.4f}")
+-    print(f"macro F1    : {m['macro_f1']:.4f}")
+-    print(f"micro F1    : {m['micro_f1']:.4f}")
++        assert checkpoint_state is not None
++        saved_context = checkpoint_state["ctx"].to(device)
++        current_context = model.prompt_learner.ctx
++        if saved_context.shape != current_context.shape:
++            raise ValueError(
++                "Checkpoint context shape does not match the constructed model: "
++                f"saved={tuple(saved_context.shape)}, "
++                f"current={tuple(current_context.shape)}"
++            )
++        current_context.data.copy_(saved_context)
++    else:
++        if args.task == "multi":
++            train_targets = train_subset[C.CLASSES].values
++            positive = train_targets.sum(axis=0)
++            negative = len(train_targets) - positive
++            positive_weight = torch.tensor(
++                negative / np.clip(positive, 1, None),
++                dtype=torch.float32,
++            )
++            model.set_pos_weight(positive_weight)
++
++        context = model.prompt_learner.ctx
++        optimizer = torch.optim.SGD(
++            [context],
++            lr=args.lr,
++            momentum=0.9,
++            weight_decay=5e-4,
++        )
++        scheduler = make_scheduler(optimizer, epochs, base_lr=args.lr)
++
++        train_dataset = ECGImageDataset(train_subset, preprocess)
++        generator = torch.Generator()
++        generator.manual_seed(args.seed)
++        train_loader = DataLoader(
++            train_dataset,
++            batch_size=batch_size,
++            shuffle=True,
++            drop_last=full,
++            num_workers=C.NUM_WORKERS,
++            generator=generator,
++        )
++
++        best_metric = -float("inf")
++        best_context = None
++        selection_name = "accuracy" if args.task == "single" else "macro AUROC"
++
++        for epoch in range(epochs):
++            model.prompt_learner.train()
++            running_loss = 0.0
++            progress = tqdm(train_loader, desc=f"epoch {epoch + 1}/{epochs}")
++
++            for images, labels in progress:
++                images = images.to(device)
++                labels = labels.to(device)
++                target = (
++                    multi_hot_to_single(labels) if args.task == "single" else labels
++                )
++
++                _, loss_ce, loss_sccm, loss_kdsp = model(images, target)
++                loss = loss_ce + loss_sccm + loss_kdsp
++                optimizer.zero_grad()
++                loss.backward()
++                optimizer.step()
++
++                running_loss += loss.item()
++                progress.set_postfix(
++                    loss=f"{loss.item():.3f}",
++                    ce=f"{loss_ce.item():.3f}",
++                    sccm=f"{loss_sccm.item():.3f}",
++                    kdsp=f"{loss_kdsp.item():.3f}",
++                )
++
++            scheduler.step()
++            val_ranking, val_probabilities, val_labels = score_split(
++                model,
++                val_df,
++                preprocess,
++                device,
++                batch_size,
++                args.task,
++            )
++
++            if args.task == "single":
++                validation_metrics = evaluate_single_label(
++                    val_probabilities,
++                    val_labels,
++                    class_names=C.CLASSES,
++                )
++                validation_metric = validation_metrics["accuracy"]
++            else:
++                validation_metrics = evaluate_multilabel(
++                    val_ranking,
++                    val_labels,
++                    val_probabilities,
++                    thresholds=args.threshold,
++                    class_names=C.CLASSES,
++                )
++                validation_metric = validation_metrics["macro_auroc"]
++
++            average_loss = running_loss / max(1, len(train_loader))
++            print(
++                f"epoch {epoch + 1}: train loss {average_loss:.4f} | "
++                f"val {selection_name} {validation_metric:.4f}"
++            )
++
++            if np.isfinite(validation_metric) and validation_metric > best_metric:
++                best_metric = validation_metric
++                best_context = context.detach().clone()
++
++        if best_context is None:
++            raise RuntimeError("No valid validation metric was produced during training")
++
++        model.prompt_learner.ctx.data.copy_(best_context)
++        checkpoint_payload = {
++            "ctx": best_context.cpu(),
++            "task": args.task,
++            "n_ctx": args.n_ctx,
++            "csc": args.csc,
++            "ctx_init": args.ctx_init,
++            "ml_temperature": args.ml_temperature,
++            "classes": list(C.CLASSES),
++            "shots": args.shots,
++            "seed": args.seed,
++            "best_validation_metric": best_metric,
++            "best_validation_metric_name": selection_name,
++        }
++        Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
++        torch.save(checkpoint_payload, ckpt_path)
++        print(
++            f"\nSaved prompt checkpoint -> {ckpt_path} "
++            f"(best val {selection_name} {best_metric:.4f})"
++        )
++
++    val_ranking, val_probabilities, val_labels = score_split(
++        model,
++        val_df,
++        preprocess,
++        device,
++        batch_size,
++        args.task,
++    )
++    test_ranking, test_probabilities, test_labels = score_split(
++        model,
++        test_df,
++        preprocess,
++        device,
++        batch_size,
++        args.task,
++    )
++
++    metrics, thresholds = evaluate_test(
++        args.task,
++        val_ranking,
++        val_probabilities,
++        val_labels,
++        test_ranking,
++        test_probabilities,
++        test_labels,
++        args.threshold_mode,
++        args.threshold,
++    )
++
++    print(f"\n=== BiomedCoOp on PTB-XL test fold: task={args.task} ===")
++    print_metrics(metrics, args.task)
++
++    suffix = "full" if full else f"{args.shots}shot"
++    result_path = Path(args.results_dir) / (
++        f"biomedcoop_{args.task}_{suffix}_seed{args.seed}.json"
++    )
++    save_result(
++        result_path,
++        metrics,
++        metadata={
++            "method": "biomedcoop",
++            "task": args.task,
++            "shots": args.shots,
++            "seed": args.seed,
++            "checkpoint": ckpt_path,
++            "classes": list(C.CLASSES),
++            "validation_fold": C.VAL_FOLD,
++            "test_fold": C.TEST_FOLD,
++            "train_records": len(train_subset),
++            "validation_records": len(val_df),
++            "test_records": len(test_df),
++            "threshold_mode": args.threshold_mode if args.task == "multi" else None,
++            "fixed_threshold": args.threshold if args.task == "multi" else None,
++            "thresholds": thresholds.tolist() if thresholds is not None else None,
++            "n_ctx": args.n_ctx,
++            "csc": args.csc,
++            "ml_temperature": args.ml_temperature,
++        },
++    )
++    print(f"Saved metrics -> {result_path}")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/zero_shot_eval.py b/zero_shot_eval.py
+index e689b6a..8028f8f 100644
+--- a/zero_shot_eval.py
++++ b/zero_shot_eval.py
+@@ -1,120 +1,219 @@
+-"""
+-Zero-shot evaluation of BiomedCLIP on PTB-XL.
+-
+-For every ECG image we compute the cosine similarity to each class text prompt,
+-turn it into a per-class score, and evaluate against the multi-label ground
+-truth on the official test fold (fold 10).
++"""Zero-shot evaluation of BiomedCLIP on PTB-XL.
+ 
+-    python zero_shot_eval.py                 # full test fold
+-    python zero_shot_eval.py --limit 500     # quick sanity check
+-    python zero_shot_eval.py --ckpt work/checkpoints/biomedclip_ft.pt
++Examples:
++    python zero_shot_eval.py --task multi
++    python zero_shot_eval.py --task single
++    python zero_shot_eval.py --task multi --ckpt work/checkpoints/biomedclip_ft.pt
+ 
+-Reported metrics:
+-    - macro AUROC  (the standard PTB-XL benchmark metric, multi-label)
+-    - macro / micro F1 at a 0.5 threshold on softmax scores
+-    - top-1 accuracy (argmax hits any positive label) — a loose sanity metric
++For the multi-label protocol, fold 9 is used only to select F1 thresholds and
++fold 10 is used once for the final report. AUROC/AUPRC use raw cosine scores;
++threshold-dependent metrics use sigmoid probabilities.
+ """
++from __future__ import annotations
++
+ import argparse
+ import os
++from pathlib import Path
+ 
+ import numpy as np
+ import pandas as pd
+ import torch
+ from PIL import Image
+ from tqdm import tqdm
+-from sklearn.metrics import roc_auc_score, f1_score
+ 
+ import config as C
+-from model_utils import load_biomedclip, build_class_text_features, get_device
++from evaluation import (
++    evaluate_multilabel,
++    evaluate_single_label,
++    print_metrics,
++    save_result,
++    tune_multilabel_thresholds,
++)
++from model_utils import build_class_text_features, get_device, load_biomedclip
+ from prepare_data import image_path_for
+ 
+ 
+ @torch.no_grad()
+ def encode_images(model, preprocess, device, ecg_ids, batch_size=C.BATCH_SIZE):
+-    """Return (n, dim) L2-normalised image embeddings for the given ecg_ids."""
+-    feats = []
++    """Return L2-normalised image embeddings for the supplied ECG IDs."""
++    features = []
+     batch = []
+     for ecg_id in tqdm(ecg_ids, desc="Encoding images"):
+-        img = Image.open(image_path_for(ecg_id)).convert("RGB")
+-        batch.append(preprocess(img))
++        image = Image.open(image_path_for(ecg_id)).convert("RGB")
++        batch.append(preprocess(image))
+         if len(batch) == batch_size:
+-            x = torch.stack(batch).to(device)
+-            e = model.encode_image(x)
+-            e = e / e.norm(dim=-1, keepdim=True)
+-            feats.append(e.cpu())
++            tensor = torch.stack(batch).to(device)
++            embedding = model.encode_image(tensor)
++            embedding = embedding / embedding.norm(dim=-1, keepdim=True)
++            features.append(embedding.cpu())
+             batch = []
++
+     if batch:
+-        x = torch.stack(batch).to(device)
+-        e = model.encode_image(x)
+-        e = e / e.norm(dim=-1, keepdim=True)
+-        feats.append(e.cpu())
+-    return torch.cat(feats, dim=0)
+-
+-
+-def evaluate(scores, labels):
+-    """scores, labels: (n, n_classes) numpy arrays."""
+-    # macro AUROC over the classes that have both pos & neg examples
+-    aucs = []
+-    for i in range(labels.shape[1]):
+-        if 0 < labels[:, i].sum() < len(labels):
+-            aucs.append(roc_auc_score(labels[:, i], scores[:, i]))
+-    macro_auc = float(np.mean(aucs)) if aucs else float("nan")
+-
+-    preds = (scores >= 0.5).astype(int)
+-    macro_f1 = f1_score(labels, preds, average="macro", zero_division=0)
+-    micro_f1 = f1_score(labels, preds, average="micro", zero_division=0)
+-
+-    top1 = scores.argmax(axis=1)
+-    top1_hit = np.mean([labels[r, top1[r]] == 1 for r in range(len(labels))])
+-    return {
+-        "macro_auroc": macro_auc,
+-        "per_class_auroc": dict(zip(C.CLASSES, [
+-            roc_auc_score(labels[:, i], scores[:, i])
+-            if 0 < labels[:, i].sum() < len(labels) else float("nan")
+-            for i in range(labels.shape[1])
+-        ])),
+-        "macro_f1": macro_f1,
+-        "micro_f1": micro_f1,
+-        "top1_acc": float(top1_hit),
+-    }
++        tensor = torch.stack(batch).to(device)
++        embedding = model.encode_image(tensor)
++        embedding = embedding / embedding.norm(dim=-1, keepdim=True)
++        features.append(embedding.cpu())
++
++    if not features:
++        raise ValueError("No images were available for evaluation")
++    return torch.cat(features, dim=0)
++
++
++def filter_single_label(df: pd.DataFrame) -> pd.DataFrame:
++    mask = df[C.CLASSES].values.sum(axis=1) == 1
++    return df.loc[mask]
++
++
++def compute_scores(model, image_features, text_features, task, temperature):
++    """Return ranking scores and probabilities.
++
++    For multi-label evaluation, raw cosine similarity is used for ranking
++    metrics and sigmoid(cosine / temperature) for threshold metrics.
++    """
++    cosine = image_features.to(text_features.device) @ text_features.t()
++
++    if task == "single":
++        logits = model.logit_scale.exp() * cosine
++        probabilities = logits.softmax(dim=-1)
++        return probabilities.cpu().numpy(), probabilities.cpu().numpy()
++
++    probabilities = torch.sigmoid(cosine / temperature)
++    return cosine.cpu().numpy(), probabilities.cpu().numpy()
++
++
++def default_run_name(task: str, checkpoint: str | None) -> str:
++    checkpoint_name = "pretrained" if checkpoint is None else Path(checkpoint).stem
++    return f"zero_shot_{task}_{checkpoint_name}"
+ 
+ 
+ def main():
+-    ap = argparse.ArgumentParser()
+-    ap.add_argument("--limit", type=int, default=None)
+-    ap.add_argument("--ckpt", type=str, default=None,
+-                    help="optional fine-tuned checkpoint")
+-    args = ap.parse_args()
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--task", choices=["multi", "single"], default="multi")
++    parser.add_argument("--limit", type=int, default=None)
++    parser.add_argument(
++        "--ckpt",
++        type=str,
++        default=None,
++        help="optional fine-tuned BiomedCLIP checkpoint",
++    )
++    parser.add_argument(
++        "--ml-temperature",
++        type=float,
++        default=0.5,
++        help="sigmoid temperature for multi-label probabilities",
++    )
++    parser.add_argument(
++        "--threshold-mode",
++        choices=["per-class", "global", "fixed"],
++        default="per-class",
++    )
++    parser.add_argument("--threshold", type=float, default=0.5)
++    parser.add_argument("--results-dir", default=os.path.join(C.WORK_DIR, "results"))
++    parser.add_argument("--run-name", default=None)
++    args = parser.parse_args()
++
++    if args.ml_temperature <= 0:
++        raise ValueError("--ml-temperature must be positive")
+ 
+     device = get_device()
+-    print(f"Device: {device}")
++    print(f"Device: {device} | task={args.task}")
+ 
+-    labels_df = pd.read_csv(os.path.join(C.WORK_DIR, "labels.csv"),
+-                            index_col="ecg_id")
++    labels_df = pd.read_csv(
++        os.path.join(C.WORK_DIR, "labels.csv"),
++        index_col="ecg_id",
++    )
++    val_df = labels_df[labels_df.strat_fold == C.VAL_FOLD]
+     test_df = labels_df[labels_df.strat_fold == C.TEST_FOLD]
+-    if args.limit:
+-        test_df = test_df.iloc[:args.limit]
+-    print(f"Test records: {len(test_df)}")
+ 
+-    model, preprocess, tokenizer = load_biomedclip(device, ckpt_path=args.ckpt)
+-
+-    text_feats = build_class_text_features(model, tokenizer, device)  # (5, dim)
+-    img_feats = encode_images(model, preprocess, device, test_df.index.tolist())
++    if args.task == "single":
++        val_df = filter_single_label(val_df)
++        test_df = filter_single_label(test_df)
+ 
+-    logit_scale = model.logit_scale.exp().item()
+-    logits = logit_scale * img_feats.to(device) @ text_feats.t()
+-    scores = logits.softmax(dim=-1).cpu().numpy()
++    if args.limit:
++        val_df = val_df.iloc[: args.limit]
++        test_df = test_df.iloc[: args.limit]
+ 
+-    labels = test_df[C.CLASSES].values.astype(int)
+-    metrics = evaluate(scores, labels)
++    print(f"Validation records: {len(val_df)} | test records: {len(test_df)}")
+ 
+-    print("\n=== Zero-shot BiomedCLIP on PTB-XL (test fold) ===")
+-    print(f"macro AUROC : {metrics['macro_auroc']:.4f}")
+-    for c, a in metrics["per_class_auroc"].items():
+-        print(f"   {c:5s} AUROC: {a:.4f}")
+-    print(f"macro F1    : {metrics['macro_f1']:.4f}")
+-    print(f"micro F1    : {metrics['micro_f1']:.4f}")
+-    print(f"top-1 acc   : {metrics['top1_acc']:.4f}")
++    model, preprocess, tokenizer = load_biomedclip(device, ckpt_path=args.ckpt)
++    model.eval()
++    text_features = build_class_text_features(model, tokenizer, device)
++
++    test_image_features = encode_images(
++        model,
++        preprocess,
++        device,
++        test_df.index.tolist(),
++    )
++    test_ranking, test_probabilities = compute_scores(
++        model,
++        test_image_features,
++        text_features,
++        args.task,
++        args.ml_temperature,
++    )
++    test_labels = test_df[C.CLASSES].values.astype(int)
++
++    if args.task == "single":
++        metrics = evaluate_single_label(
++            test_probabilities,
++            test_labels,
++            class_names=C.CLASSES,
++        )
++        thresholds = None
++    else:
++        val_image_features = encode_images(
++            model,
++            preprocess,
++            device,
++            val_df.index.tolist(),
++        )
++        _, val_probabilities = compute_scores(
++            model,
++            val_image_features,
++            text_features,
++            args.task,
++            args.ml_temperature,
++        )
++        val_labels = val_df[C.CLASSES].values.astype(int)
++        thresholds = tune_multilabel_thresholds(
++            val_labels,
++            val_probabilities,
++            mode=args.threshold_mode,
++            fixed_threshold=args.threshold,
++        )
++        metrics = evaluate_multilabel(
++            test_ranking,
++            test_labels,
++            test_probabilities,
++            thresholds=thresholds,
++            class_names=C.CLASSES,
++        )
++
++    print("\n=== Zero-shot BiomedCLIP on PTB-XL test fold ===")
++    print_metrics(metrics, args.task)
++
++    run_name = args.run_name or default_run_name(args.task, args.ckpt)
++    output_path = Path(args.results_dir) / f"{run_name}.json"
++    save_result(
++        output_path,
++        metrics,
++        metadata={
++            "method": "zero_shot",
++            "task": args.task,
++            "checkpoint": args.ckpt,
++            "classes": list(C.CLASSES),
++            "validation_fold": C.VAL_FOLD,
++            "test_fold": C.TEST_FOLD,
++            "validation_records": len(val_df),
++            "test_records": len(test_df),
++            "threshold_mode": args.threshold_mode if args.task == "multi" else None,
++            "fixed_threshold": args.threshold if args.task == "multi" else None,
++            "ml_temperature": args.ml_temperature if args.task == "multi" else None,
++            "thresholds": thresholds.tolist() if thresholds is not None else None,
++        },
++    )
++    print(f"Saved metrics -> {output_path}")
+ 
+ 
+ if __name__ == "__main__":
