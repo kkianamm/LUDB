@@ -176,26 +176,67 @@ def build_report(row) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Stratified 10-fold assignment (deterministic). LUDB has no official split, so
-# we spread each label combination across folds round-robin to keep the tiny
-# val/test folds as balanced as possible.
+# Coverage-aware split (deterministic). LUDB has no official split and is tiny
+# (200 records), so a naive fold assignment easily leaves a rare class with
+# ZERO positives in the val or test fold. Both `data_fix._guard` and
+# `train_compose.get_cached_features` abort in that case, so the split MUST put
+# at least `min_per_class` positives of every class into val AND test.
+#
+# Returns fold ids 1..10 to match the repo convention: folds 1-8 = train,
+# 9 = val, 10 = test. val/test can be made larger than 1/10 to cut the noise
+# that comes with ~20-record folds.
 # --------------------------------------------------------------------------- #
-def assign_folds(Y: np.ndarray, seed: int = 42, n_folds: int = 10) -> np.ndarray:
+def _pick_covered(candidates, Y, target_n, min_per_class, rng) -> set:
+    """Choose ~target_n indices from `candidates`, front-loading rare classes so
+    each class reaches `min_per_class` positives if at all possible."""
+    chosen: set = set()
+    counts = np.zeros(Y.shape[1], dtype=int)
+    # rarest class first
+    for c in np.argsort(Y[candidates].sum(axis=0)):
+        pos = [i for i in candidates if Y[i, c] == 1 and i not in chosen]
+        rng.shuffle(pos)
+        for i in pos:
+            if counts[c] >= min_per_class or len(chosen) >= target_n:
+                break
+            chosen.add(i)
+            counts += Y[i].astype(int)
+    # fill the rest at random
+    rest = [i for i in candidates if i not in chosen]
+    rng.shuffle(rest)
+    for i in rest:
+        if len(chosen) >= target_n:
+            break
+        chosen.add(i)
+    return chosen
+
+
+def assign_splits(Y: np.ndarray, seed=42, val_frac=0.15, test_frac=0.15,
+                  min_per_class=1) -> np.ndarray:
+    n, n_cls = Y.shape
+    totals = Y.sum(axis=0).astype(int)
+    need = 3 * min_per_class  # >=min_per_class in each of train/val/test
+    thin = {int(c): int(totals[c]) for c in range(n_cls) if totals[c] < need}
+    if thin:
+        raise ValueError(
+            f"These class indices have too few positives to guarantee "
+            f">={min_per_class}/split: {thin}. Options: use --labelset super5, "
+            f"lower --min-per-class, or merge/drop the rare class."
+        )
     rng = np.random.default_rng(seed)
-    signatures = ["".join(map(str, row.astype(int))) for row in Y]
-    order = np.argsort(signatures, kind="stable")
-    # shuffle within each signature group so ties are not systematically ordered
-    groups: dict[str, list[int]] = {}
-    for i in order:
-        groups.setdefault(signatures[i], []).append(i)
-    folds = np.zeros(len(Y), dtype=int)
-    cursor = 0
-    for sig in sorted(groups):
-        idx = groups[sig]
-        rng.shuffle(idx)
-        for i in idx:
-            folds[i] = (cursor % n_folds) + 1
-            cursor += 1
+    all_idx = list(range(n))
+    test = _pick_covered(all_idx, Y, round(test_frac * n), min_per_class, rng)
+    remaining = [i for i in all_idx if i not in test]
+    val = _pick_covered(remaining, Y, round(val_frac * n), min_per_class, rng)
+
+    folds = np.zeros(n, dtype=int)
+    for i in test:
+        folds[i] = 10
+    for i in val:
+        folds[i] = 9
+    train = [i for i in all_idx if folds[i] == 0]
+    rng.shuffle(train)
+    for k, i in enumerate(train):          # spread train across folds 1-8
+        folds[i] = (k % 8) + 1
     return folds
 
 
@@ -246,6 +287,10 @@ def main():
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--no-render", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--val-frac", type=float, default=0.15)
+    ap.add_argument("--test-frac", type=float, default=0.15)
+    ap.add_argument("--min-per-class", type=int, default=1,
+                    help="min positives per class guaranteed in EACH of val/test")
     ap.add_argument("--sampling-rate", type=int, default=None,
                     help="override fs for rendering; LUDB is natively 500 Hz")
     args = ap.parse_args()
@@ -270,7 +315,8 @@ def main():
 
     label_rows = [mapper(row) for _, row in df.iterrows()]
     Y = np.array([[r[c] for c in classes] for r in label_rows], dtype=np.float32)
-    folds = assign_folds(Y, seed=args.seed)
+    folds = assign_splits(Y, seed=args.seed, val_frac=args.val_frac,
+                          test_frac=args.test_frac, min_per_class=args.min_per_class)
 
     meta = pd.DataFrame(index=df.index)
     meta.index.name = "ecg_id"
@@ -295,9 +341,15 @@ def main():
     print(f"Records           : {len(meta)}  "
           f"(train {int((folds<=8).sum())} / val {int((folds==9).sum())} "
           f"/ test {int((folds==10).sum())})")
-    print("Per-class positives:")
+    print("Per-class positives (total | train | val | test):")
+    tr_m, va_m, te_m = folds <= 8, folds == 9, folds == 10
     for j, c in enumerate(classes):
-        print(f"  {c:8s}: {int(Y[:, j].sum())}")
+        print(f"  {c:8s}: {int(Y[:, j].sum()):3d} | "
+              f"{int(Y[tr_m, j].sum()):3d} | {int(Y[va_m, j].sum()):3d} | "
+              f"{int(Y[te_m, j].sum()):3d}")
+    if min(Y[va_m].sum(0).min(), Y[te_m].sum(0).min()) == 0:
+        print("  WARNING: a class is empty in val/test -> data_fix._guard will "
+              "abort. Raise --min-per-class or --val/--test-frac.")
     all_zero = int((Y.sum(axis=1) == 0).sum())
     multi = int((Y.sum(axis=1) > 1).sum())
     print(f"Multi-label rows  : {multi}   |   all-zero rows: {all_zero}"
